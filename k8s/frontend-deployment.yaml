@@ -1,0 +1,38 @@
+# Service file
+apiVersion: v1
+kind: Service
+metadata:
+  name: forntend-svc
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend
+  ports:
+    - name: frontend-lb
+      protocol: TCP
+      port: 80
+      targetPort: 80
+
+---
+# Deployment file
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-dep
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      name: frontend-pod
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend-pod
+          image: orionpax77/easycrud1-jenkins:frontend
+          ports:
+            - containerPort: 80
+

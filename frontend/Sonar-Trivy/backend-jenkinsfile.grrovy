@@ -1,0 +1,146 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'maven'
+    }
+
+    environment {
+        JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
+        PATH = "${JAVA_HOME}/bin:${env.PATH}"
+
+        SCANNER_HOME = tool 'sonar-scanner'
+
+        S3_BUCKET = "easycrud-bucket"
+        REGION = "us-east-1"
+
+        warFile = "backend/target/student-registration-backend-0.0.1-SNAPSHOT.jar"
+
+        DOCKER_IMAGE = "orionpax77/easycrud-b66"
+    }
+
+    stages {
+
+        stage('code-pull') {
+            steps {
+                checkout scmGit(
+                    branches: [[name: '*/main']],
+                    extensions: [],
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/faizanmansuri77/easycrud-eks-deployment-by-jenkins.git'
+                    ]]
+                )
+            }
+        }
+
+        stage('check-java') {
+            steps {
+                sh 'java -version'
+                sh 'javac -version'
+                sh 'echo $JAVA_HOME'
+            }
+        }
+
+        stage('build-backend') {
+            steps {
+                dir('backend') {
+                    sh 'mvn clean package -DskipTests'
+                }
+            }
+        }
+
+        stage("sonarqube-analysis") {
+            steps {
+
+                withSonarQubeEnv('sonar-server') {
+
+                    dir('backend') {
+
+                        sh """
+                            ${SCANNER_HOME}/bin/sonar-scanner \
+                            -Dsonar.projectKey=EasyCRUD \
+                            -Dsonar.projectName=EasyCRUD \
+                            -Dsonar.sources=src \
+                            -Dsonar.java.binaries=target/classes
+                        """
+                    }
+                }
+            }
+        }
+
+        stage("quality-gate") {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: false
+                }
+            }
+        }
+
+        stage('upload-artifact-to-s3') {
+            steps {
+
+                withCredentials([
+                    aws(
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        credentialsId: 'aws-cred',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+
+                    sh """
+                        aws s3 cp ${warFile} \
+                        s3://${S3_BUCKET}/Artifacts/ \
+                        --region ${REGION}
+                    """
+                }
+            }
+        }
+
+        stage('docker-build-backend') {
+            steps {
+
+                dir('backend') {
+
+                    sh """
+                        docker build \
+                        --build-arg SKIP_TESTS=true \
+                        -t ${DOCKER_IMAGE}:latest .
+                    """
+                }
+            }
+        }
+
+        stage('image-push') {
+            steps {
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'docker-cred',
+                        passwordVariable: 'dockerHubPassword',
+                        usernameVariable: 'dockerHubUser'
+                    )
+                ]) {
+
+                    sh '''
+                        echo $dockerHubPassword | docker login \
+                        -u $dockerHubUser --password-stdin
+                    '''
+
+                    sh """
+                        docker push ${DOCKER_IMAGE}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+
+                sh """
+                    trivy image ${DOCKER_IMAGE}:latest \
+                    > trivy-report.txt
+                """
+            }
+        }
+    }
+}

@@ -1,0 +1,247 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION        = "us-east-1"
+        DB_PORT           = "3306"
+        IMAGE_TAG         = "${BUILD_NUMBER}"
+        EKS_CLUSTER_NAME  = "easycrud-eks-cluster"
+
+        DOCKER_BACKEND  = "orionpax77/easycrud1-jenkins:backend-${BUILD_NUMBER}"
+        DOCKER_FRONTEND = "orionpax77/easycrud1-jenkins:frontend-${BUILD_NUMBER}"
+    }
+
+    stages {
+
+        // ================= CHECKOUT =================
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/faizanmansuri77/easycrud-eks-deployment-by-jenkins.git'
+            }
+        }
+
+        // ================= TERRAFORM =================
+
+        stage('Terraform Init & Apply') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-creds',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh """
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+
+                        terraform -chdir=terraform init -upgrade
+                        terraform -chdir=terraform validate
+                        terraform -chdir=terraform apply --auto-approve
+                    """
+                }
+            }
+        }
+
+        stage('Fetch RDS Endpoint') {
+            steps {
+                script {
+                    env.RDS_ENDPOINT = sh(
+                        script: "terraform -chdir=terraform output -raw rds_endpoint",
+                        returnStdout: true
+                    ).trim()
+                    echo "RDS Endpoint: ${env.RDS_ENDPOINT}"
+                }
+            }
+        }
+
+        // ================= CREATE DATABASE =================
+
+        stage('Create MariaDB Database & Table') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'rds-creds',
+                    usernameVariable: 'DB_USER',
+                    passwordVariable: 'DB_PASS'
+                )]) {
+                    sh """
+                        export MYSQL_PWD="$DB_PASS"
+
+                        mysql -h "${RDS_ENDPOINT}" \
+                              -P "${DB_PORT}" \
+                              -u "${DB_USER}" <<EOF
+
+                        CREATE DATABASE IF NOT EXISTS student_db;
+
+                        USE student_db;
+
+                        CREATE TABLE IF NOT EXISTS students (
+                            id BIGINT NOT NULL AUTO_INCREMENT,
+                            name VARCHAR(255),
+                            email VARCHAR(255),
+                            course VARCHAR(255),
+                            student_class VARCHAR(255),
+                            percentage DOUBLE,
+                            branch VARCHAR(255),
+                            mobile_number VARCHAR(255),
+                            PRIMARY KEY (id)
+                        );
+
+EOF
+                    """
+                }
+            }
+        }
+
+        // ================= UPDATE BACKEND CONFIG =================
+
+        stage('Update application.properties') {
+            steps {
+                sh """
+                    sed -i 's|spring.datasource.url=.*|spring.datasource.url=jdbc:mariadb://${RDS_ENDPOINT}:${DB_PORT}/student_db?sslMode=trust|' backend/src/main/resources/application.properties
+                    sed -i 's|spring.datasource.username=.*|spring.datasource.username=admin|' backend/src/main/resources/application.properties
+                    sed -i 's|spring.datasource.password=.*|spring.datasource.password=redhat123|' backend/src/main/resources/application.properties
+                    sed -i 's|spring.jpa.hibernate.ddl-auto=.*|spring.jpa.hibernate.ddl-auto=update|' backend/src/main/resources/application.properties
+                    sed -i 's|spring.jpa.show-sql=.*|spring.jpa.show-sql=true|' backend/src/main/resources/application.properties
+                    sed -i 's|spring.datasource.driver-class-name=.*|spring.datasource.driver-class-name=org.mariadb.jdbc.Driver|' backend/src/main/resources/application.properties
+                """
+            }
+        }
+
+        // ================= BUILD & PUSH BACKEND =================
+
+        stage('Build Backend Image') {
+            steps {
+                dir('backend') {
+                    sh "docker build -t ${DOCKER_BACKEND} . --no-cache"
+                }
+            }
+        }
+
+        stage('Push Backend Image') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push ${DOCKER_BACKEND}
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        // ================= DEPLOY BACKEND =================
+
+        stage('Deploy Backend & Fetch LB') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-creds',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+
+                    script {
+                        sh """
+                            export AWS_DEFAULT_REGION=${AWS_REGION}
+
+                            aws eks update-kubeconfig \
+                                --region ${AWS_REGION} \
+                                --name ${EKS_CLUSTER_NAME}
+
+                            kubectl apply -f k8s/backend-deployment.yaml
+                            kubectl set image deployment/backend-dep backend=${DOCKER_BACKEND}
+                            kubectl rollout status deployment/backend-dep
+                        """
+
+                        sleep 30
+
+                        env.BACKEND_LB = sh(
+                            script: "kubectl get svc backend-svc -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'",
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Backend LB DNS: ${env.BACKEND_LB}"
+                    }
+                }
+            }
+        }
+
+        // ================= UPDATE FRONTEND ENV =================
+
+        stage('Update Frontend .env File') {
+            steps {
+                sh """
+                    sed -i 's|VITE_API_URL=.*|VITE_API_URL=http://${BACKEND_LB}:8080/api|' frontend/.env
+                """
+            }
+        }
+
+        // ================= BUILD & PUSH FRONTEND =================
+
+        stage('Build Frontend Image') {
+            steps {
+                dir('frontend') {
+                    sh "docker build -t ${DOCKER_FRONTEND} . --no-cache"
+                }
+            }
+        }
+
+        stage('Push Frontend Image') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push ${DOCKER_FRONTEND}
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        // ================= DEPLOY FRONTEND =================
+
+        stage('Deploy Frontend to EKS') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-creds',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh """
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+
+                         aws eks update-kubeconfig \
+                             --region ${AWS_REGION} \
+                             --name ${EKS_CLUSTER_NAME}
+                         
+                         kubectl apply -f k8s/frontend-deployment.yaml
+                         kubectl set image deployment/frontend-dep frontend-pod=${DOCKER_FRONTEND}
+                         kubectl rollout status deployment/frontend-dep
+
+                         kubectl get pods
+                         kubectl get svc
+                """
+            }
+        }
+    }
+    }
+
+    post {
+        success {
+            echo "🎉 Full CI/CD Deployment Completed Successfully!"
+        }
+        failure {
+            echo "❌ Pipeline Failed!"
+        }
+    }
+}
